@@ -645,7 +645,7 @@ impl ConnectMessageHandler {
                 content,
                 message_type: ContentMessageType::Text,
                 metadata: serde_json::Value::Object(serde_json::Map::new()),
-                channel_type: 1, // DM (system ↔ user)
+                channel_type: privchat_protocol::protocol::ChannelType::Direct.as_wire(), // DM (system ↔ user)
                 recipient_user_ids: vec![user_id],
                 dedup_key: None,
                 attachment_refs_override: None,

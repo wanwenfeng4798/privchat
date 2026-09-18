@@ -250,11 +250,7 @@ impl SendMessageHandler {
     }
 
     fn channel_type_code(channel_type: crate::model::channel::ChannelType) -> u8 {
-        match channel_type {
-            crate::model::channel::ChannelType::Direct => 1,
-            crate::model::channel::ChannelType::Group => 2,
-            crate::model::channel::ChannelType::Room => 3,
-        }
+        channel_type.to_wire_u8()
     }
 }
 

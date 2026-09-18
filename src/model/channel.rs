@@ -15,6 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use privchat_protocol::protocol::ChannelType as WireChannelType;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -69,33 +70,36 @@ impl ChannelType {
         self as i16
     }
 
-    /// 转换为**线上（wire）表示**：Direct=1, Group=2, Room=3。
+    /// 线上(wire)表示的唯一真源是 `privchat_protocol::protocol::ChannelType`
+    /// (Direct=1 / Group=2 / Room=3);本枚举只是 **DB 存储编号**(0/1/2)。
     ///
-    /// DB 与 wire 的编号差 1，两者绝不能混用：把 DB 值当 wire 传下去时，
-    /// Group(DB 1) 会被读成 Direct(wire 1)、Room(DB 2) 会被读成 Group(wire 2)，
-    /// `message_repo` 的 channel-type 校验随即拒写（sync commit 静默失败，
-    /// 客户端收不到 revoke/reaction 更新）。任何需要 wire 值的地方都走这里。
-    pub fn to_wire_u8(self) -> u8 {
-        (self.to_i16() as u8) + 1
+    /// 两套编号差 1,绝不能混用:把 DB 值当 wire 传下去,Group(DB 1)会被读成
+    /// Direct(wire 1)、Room(DB 2)会被读成 Group(wire 2)——subscribe 处理器曾
+    /// 因此把群聊订阅当成 Room 去要票据,四天拒绝了 443 次。任何需要 wire 值的地方
+    /// 都走这里,不要再手写数字。
+    pub fn to_wire(self) -> WireChannelType {
+        match self {
+            ChannelType::Direct => WireChannelType::Direct,
+            ChannelType::Group => WireChannelType::Group,
+            ChannelType::Room => WireChannelType::Room,
+        }
     }
 
-    /// 从**线上（wire）表示**解析：Direct=1, Group=2, Room=3。
-    ///
-    /// 🔴 与 [`Self::from_i16`] 差一位，两个千万别用混。
-    ///
-    /// 拿 wire 值直接去 match DB 编号，出来的是"群聊被当成 Room、Room 被当成群聊"，
-    /// 而且不会报错——只是走进了另一条分支。subscribe 处理器就这么错过：客户端订阅
-    /// 群聊（wire 2）被读成 Room，于是去要 room ticket，四天里拒绝了 443 次订阅，
-    /// 所有群聊的实时订阅实际都是失败的。
-    ///
-    /// 返回 None 而不是兜底成 Direct：解析不出来的值是协议错误，不该被悄悄当成单聊。
-    pub fn from_wire_u8(value: u8) -> Option<Self> {
+    pub fn to_wire_u8(self) -> u8 {
+        self.to_wire().as_wire()
+    }
+
+    pub fn from_wire(value: WireChannelType) -> Self {
         match value {
-            1 => Some(ChannelType::Direct),
-            2 => Some(ChannelType::Group),
-            3 => Some(ChannelType::Room),
-            _ => None,
+            WireChannelType::Direct => ChannelType::Direct,
+            WireChannelType::Group => ChannelType::Group,
+            WireChannelType::Room => ChannelType::Room,
         }
+    }
+
+    /// 从 wire 字节解析;0 与未知值是协议错误,返回 None 而不是兜底成 Direct。
+    pub fn from_wire_u8(value: u8) -> Option<Self> {
+        WireChannelType::from_wire(value).map(Self::from_wire)
     }
 }
 

@@ -2062,7 +2062,7 @@ async fn send_system_message_to_user(
             content: request.content.clone(),
             message_type,
             metadata,
-            channel_type: 1, // 1 = Direct
+            channel_type: privchat_protocol::protocol::ChannelType::Direct.as_wire(),
             recipient_user_ids: vec![sender_id, request.user_id],
             dedup_key: None,
             attachment_refs_override: None,

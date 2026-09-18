@@ -253,11 +253,10 @@ impl PgMessageRepository {
         .map_err(|e| DatabaseError::Database(format!("Failed to lock channel: {e}")))?
         .ok_or_else(|| DatabaseError::NotFound(format!("Channel not found: {channel_id}")))?;
 
-        let expected_db_channel_type = match wire_channel_type {
-            1 => 0, // Direct
-            2 => 1, // Group
-            3 => 2, // Room
-            value => {
+        let expected_db_channel_type = match crate::model::channel::ChannelType::from_wire_u8(u8::try_from(wire_channel_type).unwrap_or(u8::MAX)) {
+            Some(ty) => ty.to_i16(),
+            None => {
+                let value = wire_channel_type;
                 return Err(DatabaseError::Database(format!(
                     "unsupported wire channel type for {channel_id}: {value}"
                 )))
