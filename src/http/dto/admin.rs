@@ -589,4 +589,8 @@ pub struct RoomBroadcastRequest {
     #[serde(default)]
     pub content_base64: Option<String>,
     pub sender_id: Option<u64>,
+    /// 可选的 topic 标注,原样进 `PublishRequest.topic`;订阅端据此分流
+    /// (ROOM_CHANNEL_SPEC:topic 由服务端标注,客户端不自造)。
+    #[serde(default)]
+    pub topic: Option<String>,
 }

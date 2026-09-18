@@ -994,7 +994,7 @@ async fn room_broadcast(
     // Room 广播使用 PublishRequest（发布订阅协议）
     let publish_request = privchat_protocol::protocol::PublishRequest {
         channel_id,
-        topic: None,
+        topic: payload.topic.clone().filter(|t| !t.is_empty()),
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
