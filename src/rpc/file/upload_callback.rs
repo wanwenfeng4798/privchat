@@ -112,7 +112,8 @@ where
             .ok_or(CallbackError::SessionGone("该次上传的会话已不存在"))?;
 
             session
-                .completed_file_id()
+                .completed_file_id_async()
+                .await
                 .map_err(|_| CallbackError::SessionGone("会话状态已损坏"))?
                 .ok_or(CallbackError::Rejected("该次上传尚未完成，无法回调"))?
         }
@@ -347,7 +348,8 @@ async fn chunked_callback(
     };
 
     let expected = session
-        .completed_file_id()
+        .completed_file_id_async()
+        .await
         .map_err(|e| RpcError::internal(e.to_string()))?
         .ok_or_else(|| RpcError::validation("该次上传尚未完成，无法回调".to_string()))?;
     check_callback_target_id(Some(expected), reported)
@@ -366,7 +368,7 @@ async fn chunked_callback(
     // 把一条已完成的消息判成发送失败。
     match session.try_lock() {
         Ok(Some(_lock)) => {
-            if let Err(e) = session.discard() {
+            if let Err(e) = session.discard_async().await {
                 warn!("⚠️ 分片会话目录清理失败（交扫描兜底）: {e}");
             }
         }

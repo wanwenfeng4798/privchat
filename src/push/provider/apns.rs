@@ -73,7 +73,7 @@ impl ApnsProvider {
             })?;
 
         Ok(Self {
-            client: Client::new(),
+            client: super::build_http_client(),
             bundle_id,
             team_id,
             key_id,

@@ -95,7 +95,7 @@ impl FcmProvider {
             .filter(|it| !it.is_empty())
             .unwrap_or_else(|| account.project_id.clone());
         Ok(Self {
-            client: Client::new(),
+            client: super::build_http_client(),
             project_id,
             credentials: Arc::new(Credentials::ServiceAccount {
                 account,
@@ -112,7 +112,7 @@ impl FcmProvider {
              且不会自动恢复。生产请改配 push.fcm.service_account_path"
         );
         Self {
-            client: Client::new(),
+            client: super::build_http_client(),
             project_id,
             credentials: Arc::new(Credentials::StaticToken(access_token)),
         }

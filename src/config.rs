@@ -1002,6 +1002,36 @@ impl ServerConfig {
             anyhow::bail!("[database] acquire_timeout_seconds 必须大于 0");
         }
 
+        // [gateway] 限流/心跳参数：配 0 等于关闭限流或让心跳/超时失效，
+        // 故障表现（连接暴涨/心跳风暴）远离成因（一个配错的 0）。
+        if self.max_connections == 0 {
+            anyhow::bail!("[gateway] max_connections 必须大于 0");
+        }
+        if self.handler_max_inflight == 0 {
+            anyhow::bail!("[gateway] handler_max_inflight 必须大于 0");
+        }
+        if self.connection_timeout == 0 {
+            anyhow::bail!("[gateway] connection_timeout 必须大于 0");
+        }
+        if self.heartbeat_interval == 0 {
+            anyhow::bail!("[gateway] heartbeat_interval 必须大于 0");
+        }
+
+        // [cache.redis] command_timeout 是保命参数（STABILITY_SPEC §9.2）：配 0 时
+        // infra/redis.rs 的 with_timeout 会让所有 Redis 命令立即超时/失败，L2 缓存/
+        // 离线队列/presence 全面降级，而故障表现远离成因。仅在配了 redis 时校验。
+        if let Some(redis) = &self.cache.redis {
+            if redis.pool_size == 0 {
+                anyhow::bail!("[cache.redis] pool_size 必须大于 0");
+            }
+            if redis.command_timeout_ms == 0 {
+                anyhow::bail!("[cache.redis] command_timeout_ms 必须大于 0");
+            }
+            if redis.connection_timeout_secs == 0 {
+                anyhow::bail!("[cache.redis] connection_timeout_secs 必须大于 0");
+            }
+        }
+
         // [auth.jwt] fail-fast 校验（算法 + 对应密钥）
         self.jwt
             .validate()
@@ -2320,6 +2350,26 @@ pub struct PushConfig {
     pub zte: PushZteConfig,
     /// Meizu 配置
     pub meizu: PushMeizuConfig,
+    /// 单条推送的最大重试次数（PUSH_SPEC §10 / §14 `push.max_retry`）。
+    /// 退避固定为 10s / 30s / 120s，超过此数放弃并记录日志。
+    #[serde(default = "default_push_max_retry")]
+    pub max_retry: u32,
+    /// 限流窗口（秒），PUSH_SPEC §14 `push.rate_limit_window`，默认 60s。
+    #[serde(default = "default_push_rate_limit_window_secs")]
+    pub rate_limit_window_secs: u64,
+    /// 同一用户在限流窗口内最多推送条数，PUSH_SPEC §14 `push.rate_limit_max`，默认 10。
+    #[serde(default = "default_push_rate_limit_max")]
+    pub rate_limit_max: u32,
+}
+
+fn default_push_max_retry() -> u32 {
+    3
+}
+fn default_push_rate_limit_window_secs() -> u64 {
+    60
+}
+fn default_push_rate_limit_max() -> u32 {
+    10
 }
 
 impl Default for PushConfig {
@@ -2336,6 +2386,9 @@ impl Default for PushConfig {
             lenovo: PushLenovoConfig::default(),
             zte: PushZteConfig::default(),
             meizu: PushMeizuConfig::default(),
+            max_retry: default_push_max_retry(),
+            rate_limit_window_secs: default_push_rate_limit_window_secs(),
+            rate_limit_max: default_push_rate_limit_max(),
         }
     }
 }

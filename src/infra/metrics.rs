@@ -51,6 +51,18 @@ const COUNTER_OFFLINE_TRY_SEND_FAIL: &str = "privchat_offline_try_send_fail_tota
 const COUNTER_OFFLINE_FALLBACK: &str = "privchat_offline_fallback_total";
 
 // ---------------------------------------------------------------------------
+// PUSH 观测指标（STABILITY_SPEC 禁令 4：队列深度 / inflight / 超时率）
+// ---------------------------------------------------------------------------
+
+/// 当前存活的推送任务数（Gauge）。worker 逐条 spawn，该值反映挂起任务堆积程度；
+/// provider 端点黑洞时它会顶到 Semaphore 上限（PUSH_MAX_CONCURRENT）并持平——
+/// 持平是有界，持续上涨才是无界泄漏。供 G10 soak 与黑洞演练判读。
+const GAUGE_PUSH_INFLIGHT: &str = "privchat_push_inflight_tasks";
+/// 累计推送 intent 处理超时次数（Counter）。外层硬超时兜底命中时 +1，
+/// 正常情况应恒为 0；非零即说明 provider 或下游查询出现未预见的挂起。
+const COUNTER_PUSH_TIMEOUT: &str = "privchat_push_intent_timeout_total";
+
+// ---------------------------------------------------------------------------
 // CONNECTION_LIFECYCLE_SPEC 观测指标
 // ---------------------------------------------------------------------------
 
@@ -253,6 +265,16 @@ pub fn record_offline_try_send_fail(count: u64) {
 /// 记录离线队列降级（fallback）次数（Counter）。
 pub fn record_offline_fallback(count: u64) {
     metrics::counter!(COUNTER_OFFLINE_FALLBACK).absolute(count);
+}
+
+/// 更新当前存活推送任务数（Gauge）。worker 每次 spawn/任务结束时调用。
+pub fn record_push_inflight(count: usize) {
+    metrics::gauge!(GAUGE_PUSH_INFLIGHT).set(count as f64);
+}
+
+/// 记录推送 intent 处理超时（Counter）。外层硬超时兜底命中时调用。
+pub fn record_push_timeout() {
+    metrics::counter!(COUNTER_PUSH_TIMEOUT).increment(1);
 }
 
 // ---------------------------------------------------------------------------

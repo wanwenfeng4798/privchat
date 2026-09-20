@@ -274,10 +274,18 @@ impl OfflineMessageWorker {
                             "⚠️ OfflineWorker 并发投递已满 (max={}), 用户 {} 等待 permit",
                             worker_push.config.max_concurrent_users, user_id
                         );
-                        let permit = sem
-                            .acquire_owned()
-                            .await
-                            .expect("delivery semaphore closed");
+                        // 🔴 不能用 expect：semaphore 在关闭序列中可能被先 close，
+                        // 此处 panic 会让后台 worker 任务静默死亡，4096 队列无人消费。
+                        // Must-Deliver 语义由「等待而非 try」保证；关闭时上游 sender
+                        // 先停、recv() 自然返回 None，这里只是兜底 semaphore 先被 close
+                        // 的竞态——优雅退出循环，不 panic。
+                        let permit = match sem.acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => {
+                                info!("delivery semaphore closed, 退出离线投递循环");
+                                break;
+                            }
+                        };
                         tokio::spawn(async move {
                             let _permit = permit;
                             if let Err(e) = worker.deliver_all_user_messages(&user_id).await {

@@ -291,10 +291,23 @@ impl ServiceRegistry {
                 Ok(selected)
             }
             LoadBalanceStrategy::HealthBased => {
+                // 🔴 不用 unwrap：health_score() 当前不会 NaN，但任何引入除法加权的
+                // 修改都可能产生 NaN → partial_cmp 返回 None → unwrap panic。用
+                // unwrap_or(Equal) 兜底；外层 max_by 在非空集合上必返回 Some（:271
+                // 已保证非空），但仍用 ok_or 防御未来重构打破该前提。
                 let selected = healthy_connections
                     .iter()
-                    .max_by(|a, b| a.health_score().partial_cmp(&b.health_score()).unwrap())
-                    .unwrap();
+                    .max_by(|a, b| {
+                        a.health_score()
+                            .partial_cmp(&b.health_score())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .ok_or_else(|| {
+                        crate::error::ServerError::Internal(format!(
+                            "健康连接选择失败: {}",
+                            service_name
+                        ))
+                    })?;
                 Ok(selected)
             }
             LoadBalanceStrategy::WeightedRoundRobin => {

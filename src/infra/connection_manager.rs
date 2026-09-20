@@ -632,7 +632,11 @@ impl ConnectionManager {
         }
 
         // 物理断开
-        let transport = self.transport_server.read().await;
+        // 🔴 不能持 transport_server 读锁跨 close_session().await：close_session 内部若因
+        // 传输层背压挂起，读 guard 存活期间所有需要 write() 该锁的路径（transport
+        // 注入/替换）被阻塞。与同文件 :1130 同口径——clone 出 Arc 后立即释放 guard
+        // 再 await（RwLock 读 guard 在 clone 后的临时值上 drop，不跨 await）。
+        let transport = self.transport_server.read().await.clone();
         if let Some(server) = transport.as_ref() {
             if let Err(e) = server.close_session(session_id).await {
                 warn!(

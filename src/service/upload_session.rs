@@ -164,41 +164,15 @@ impl UploadSession {
         &self.dir
     }
 
-    fn state_path(&self) -> PathBuf {
-        self.dir.join("state.json")
-    }
-
     pub fn read_state(&self) -> Result<SessionState> {
-        match std::fs::read(self.state_path()) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| ServerError::Internal(format!("会话状态损坏: {e}"))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SessionState::default()),
-            Err(e) => Err(ServerError::Internal(format!("读会话状态失败: {e}"))),
-        }
+        read_state_at(&self.dir)
     }
 
     /// 原子替换 `state.json`：写临时文件 → fsync → rename → fsync 目录。
     ///
     /// 🔴 不能原地改写：断电时留下半截 JSON，会话就再也读不回来了。
     pub fn write_state(&self, state: &SessionState) -> Result<()> {
-        let tmp = self.dir.join("state.tmp");
-        let bytes = serde_json::to_vec(state)
-            .map_err(|e| ServerError::Internal(format!("序列化会话状态失败: {e}")))?;
-        {
-            let mut f = File::create(&tmp)
-                .map_err(|e| ServerError::Internal(format!("写会话状态失败: {e}")))?;
-            f.write_all(&bytes)
-                .map_err(|e| ServerError::Internal(format!("写会话状态失败: {e}")))?;
-            f.sync_all()
-                .map_err(|e| ServerError::Internal(format!("同步会话状态失败: {e}")))?;
-        }
-        std::fs::rename(&tmp, self.state_path())
-            .map_err(|e| ServerError::Internal(format!("替换会话状态失败: {e}")))?;
-        // 目录项本身也要落盘，否则 rename 可能在崩溃后丢失。
-        if let Ok(d) = File::open(&self.dir) {
-            let _ = d.sync_all();
-        }
-        Ok(())
+        write_state_at(&self.dir, state)
     }
 
     /// 直接把会话标成已完成（用于「发现正式记录已存在」时补写墓碑）。
@@ -305,6 +279,123 @@ impl UploadSession {
         std::fs::remove_dir_all(&dir)
             .map_err(|e| ServerError::Internal(format!("删除会话目录 {dir:?} 失败: {e}")))
     }
+
+    // ===== 异步包装（P0-1）：把带 fsync 的 state.json 读改写移出反应堆线程 =====
+    //
+    // 🔴 flock 锁句柄（`self.lock`）归本会话所有，始终留在 async 侧；blocking 任务
+    // 只按 `dir` 路径读写 state.json，不碰锁。同步方法保留给测试与 Drop 回滚用。
+
+    /// [`Self::open`] 的异步版：建目录 + 打开锁文件移出反应堆。
+    pub async fn open_async(root: PathBuf, uid: u64, upload_id: String) -> Result<Self> {
+        tokio::task::spawn_blocking(move || Self::open(&root, uid, &upload_id))
+            .await
+            .map_err(|e| join_to_internal("打开上传会话", e))?
+    }
+
+    /// [`Self::read_state`] 的异步版。
+    pub async fn read_state_async(&self) -> Result<SessionState> {
+        let dir = self.dir.clone();
+        tokio::task::spawn_blocking(move || read_state_at(&dir))
+            .await
+            .map_err(|e| join_to_internal("读会话状态", e))?
+    }
+
+    /// [`Self::write_state`] 的异步版（原子写 + fsync 目录）。
+    pub async fn write_state_async(&self, state: SessionState) -> Result<()> {
+        let dir = self.dir.clone();
+        tokio::task::spawn_blocking(move || write_state_at(&dir, &state))
+            .await
+            .map_err(|e| join_to_internal("写会话状态", e))?
+    }
+
+    /// [`Self::completed_file_id`] 的异步版。
+    pub async fn completed_file_id_async(&self) -> Result<Option<u64>> {
+        let dir = self.dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let st = read_state_at(&dir)?;
+            Ok(if st.status == UploadStatus::Completed { st.file_id } else { None })
+        })
+        .await
+        .map_err(|e| join_to_internal("读完成墓碑", e))?
+    }
+
+    /// [`Self::reserved_file_id`] 的异步版。
+    pub async fn reserved_file_id_async(&self) -> Result<Option<u64>> {
+        let dir = self.dir.clone();
+        tokio::task::spawn_blocking(move || Ok(read_state_at(&dir)?.reserved_file_id))
+            .await
+            .map_err(|e| join_to_internal("读预留 file_id", e))?
+    }
+
+    /// [`Self::mark_completed`] 的异步版。
+    pub async fn mark_completed_async(&self, file_id: u64) -> Result<()> {
+        let dir = self.dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut st = read_state_at(&dir)?;
+            st.status = UploadStatus::Completed;
+            st.file_id = Some(file_id);
+            write_state_at(&dir, &st)
+        })
+        .await
+        .map_err(|e| join_to_internal("写完成墓碑", e))?
+    }
+
+    /// [`Self::reserve_file_id`] 的异步版。
+    pub async fn reserve_file_id_async(&self, file_id: u64) -> Result<()> {
+        let dir = self.dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut st = read_state_at(&dir)?;
+            st.reserved_file_id = Some(file_id);
+            write_state_at(&dir, &st)
+        })
+        .await
+        .map_err(|e| join_to_internal("写预留 file_id", e))?
+    }
+
+    /// [`Self::begin_whole`] 的异步版。
+    ///
+    /// 🔴 `try_lock_exclusive` 是**非阻塞** flock（快，且锁句柄必须归本会话），留在
+    /// async 侧；随后的状态读改写（含 fsync）移出反应堆。校验失败时不建 ModeGuard，
+    /// 已拿到的 flock 随调用方 drop 会话而释放（与同步版行为一致）。
+    pub async fn begin_whole_async(&self) -> Result<ModeGuard<'_>> {
+        if !self.try_lock_exclusive()? {
+            return Err(ServerError::Validation("同一份上传正在进行中".to_string()));
+        }
+        let dir = self.dir.clone();
+        let prepared = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut state = read_state_at(&dir)?;
+            match (state.mode, state.status) {
+                (_, UploadStatus::Completed) => {
+                    return Err(ServerError::Validation(format!(
+                        "该上传已完成（file_id={:?}）",
+                        state.file_id
+                    )));
+                }
+                (UploadMode::Resumable, _) => {
+                    return Err(ServerError::Validation(
+                        "该 token 已用于分片上传，不能再走整包".to_string(),
+                    ));
+                }
+                (_, UploadStatus::WholeReceiving) => {
+                    tracing::warn!(
+                        "🔧 会话 {:?} 停在 WholeReceiving 但锁是空的：按崩溃恢复处理",
+                        dir
+                    );
+                }
+                _ => {}
+            }
+            state.mode = UploadMode::Whole;
+            state.status = UploadStatus::WholeReceiving;
+            write_state_at(&dir, &state)
+        })
+        .await
+        .map_err(|e| join_to_internal("进入整包模式", e))?;
+        prepared?;
+        Ok(ModeGuard {
+            session: self,
+            committed: std::cell::Cell::new(false),
+        })
+    }
 }
 
 impl ModeGuard<'_> {
@@ -316,6 +407,28 @@ impl ModeGuard<'_> {
         self.session.write_state(&state)?;
         self.committed.set(true);
         Ok(())
+    }
+
+    /// [`Self::complete`] 的异步版（P0-1）：读改写移出反应堆。成功后置 committed，
+    /// drop 不再回滚；失败（含阻塞任务 panic）时 committed 仍为 false，drop 按同步
+    /// 口径回滚到 Idle，与同步版行为一致。
+    pub async fn complete_async(self, file_id: u64) -> Result<()> {
+        let dir = self.session.dir.clone();
+        let r = tokio::task::spawn_blocking(move || {
+            let mut state = read_state_at(&dir)?;
+            state.status = UploadStatus::Completed;
+            state.file_id = Some(file_id);
+            write_state_at(&dir, &state)
+        })
+        .await;
+        match r {
+            Ok(Ok(())) => {
+                self.committed.set(true);
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(join_to_internal("写完成状态", e)),
+        }
     }
 }
 
@@ -334,6 +447,45 @@ impl Drop for ModeGuard<'_> {
             }
         }
     }
+}
+
+/// `state.json` 的读（不存在 = 默认态）。纯文件系统操作，供同步方法与
+/// `spawn_blocking` 包装共用（P0-1）。
+fn read_state_at(dir: &Path) -> Result<SessionState> {
+    match std::fs::read(dir.join("state.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| ServerError::Internal(format!("会话状态损坏: {e}"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SessionState::default()),
+        Err(e) => Err(ServerError::Internal(format!("读会话状态失败: {e}"))),
+    }
+}
+
+/// 原子替换 `state.json`：写临时文件 → fsync → rename → fsync 目录。
+/// 🔴 不能原地改写：断电时留下半截 JSON，会话就再也读不回来了。
+fn write_state_at(dir: &Path, state: &SessionState) -> Result<()> {
+    let tmp = dir.join("state.tmp");
+    let bytes = serde_json::to_vec(state)
+        .map_err(|e| ServerError::Internal(format!("序列化会话状态失败: {e}")))?;
+    {
+        let mut f = File::create(&tmp)
+            .map_err(|e| ServerError::Internal(format!("写会话状态失败: {e}")))?;
+        f.write_all(&bytes)
+            .map_err(|e| ServerError::Internal(format!("写会话状态失败: {e}")))?;
+        f.sync_all()
+            .map_err(|e| ServerError::Internal(format!("同步会话状态失败: {e}")))?;
+    }
+    std::fs::rename(&tmp, dir.join("state.json"))
+        .map_err(|e| ServerError::Internal(format!("替换会话状态失败: {e}")))?;
+    // 目录项本身也要落盘，否则 rename 可能在崩溃后丢失。
+    if let Ok(d) = File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+/// `spawn_blocking` 的 JoinError → 统一的 ServerError。
+fn join_to_internal(what: &str, e: tokio::task::JoinError) -> ServerError {
+    ServerError::Internal(format!("{what} 的阻塞任务异常退出: {e}"))
 }
 
 #[cfg(unix)]

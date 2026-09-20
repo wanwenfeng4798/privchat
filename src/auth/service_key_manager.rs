@@ -17,9 +17,24 @@
 
 use crate::auth::models::ServiceKeyConfig;
 use crate::error::{Result, ServerError};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// 计算 key 的脱敏指纹（sha256 前 8 字节，hex 编码 16 字符）。
+///
+/// 🔴 日志里绝不能出现 key 原文。`display_expected` 曾经直接返回 `master.clone()`，
+/// 于是任何一次错误的 key 尝试（扫描器、配错的下游、旧版本客户端）都会把**真实
+/// master key 明文**写进 warn 日志；日志被采集/轮转/外送即密钥泄露，而持有它就能
+/// 签发任意用户的 IM token。Whitelist 分支更糟——它把整个白名单 join 后打出去。
+///
+/// 指纹足够运维做关联（同一个 key 每次指纹一致，可比对「期望 vs 实际」），
+/// 但 sha256 单向，反推不出原文。攻击者提交的 key 同样只记指纹，不记原文。
+pub(crate) fn fingerprint(key: &str) -> String {
+    let hash = Sha256::digest(key.as_bytes());
+    format!("sha256:{}", hex::encode(&hash[..8]))
+}
 
 /// Service Key 管理策略
 pub enum ServiceKeyStrategy {
@@ -77,14 +92,17 @@ impl ServiceKeyManager {
         }
     }
 
-    /// 获取期望的 key 信息（用于调试日志）
+    /// 获取期望的 key 信息（用于调试日志）。
+    ///
+    /// 🔴 只返回**指纹**，绝不返回原文。见 [`fingerprint`] 的威胁说明。
     pub async fn display_expected(&self) -> String {
         match &self.strategy {
-            ServiceKeyStrategy::MasterKey(master) => master.clone(),
+            ServiceKeyStrategy::MasterKey(master) => fingerprint(master),
             ServiceKeyStrategy::AllowAny => "[allow-any]".to_string(),
             ServiceKeyStrategy::Whitelist(whitelist) => {
                 let keys = whitelist.read().await;
-                keys.iter().cloned().collect::<Vec<_>>().join(", ")
+                let fps: Vec<String> = keys.iter().map(|k| fingerprint(k)).collect();
+                format!("[whitelist: {} keys] {}", fps.len(), fps.join(", "))
             }
         }
     }
@@ -114,7 +132,10 @@ impl ServiceKeyManager {
         }
     }
 
-    /// 列出所有 key（仅白名单模式支持）
+    /// 列出所有 key（仅白名单模式支持）。
+    ///
+    /// 🔴 返回的是**原文**，仅供受控的管理面（已鉴权的 admin API）在内存里使用，
+    /// **绝不可写进日志**。需要打日志时用 [`fingerprint`] 或 [`display_expected`]。
     pub async fn list_keys(&self) -> Result<Vec<String>> {
         match &self.strategy {
             ServiceKeyStrategy::Whitelist(whitelist) => {
@@ -194,5 +215,41 @@ mod tests {
         assert!(constant_time_compare(b"hello", b"hello"));
         assert!(!constant_time_compare(b"hello", b"world"));
         assert!(!constant_time_compare(b"short", b"verylongstring"));
+    }
+
+    /// 🔴 回归防护：display_expected 绝不能把 key 原文吐出来。
+    ///
+    /// 这条测试锁住 P1-1 的修复：曾经 MasterKey 分支返回 `master.clone()`、
+    /// Whitelist 分支返回整个白名单 join，任何一次错误 key 尝试都会把真实密钥
+    /// 写进 warn 日志。改成指纹后，原文一个字符都不能出现在返回值里。
+    #[tokio::test]
+    async fn display_expected_never_leaks_raw_key() {
+        let master = ServiceKeyManager::new_master_key("super-secret-master-key-2026".to_string());
+        let displayed = master.display_expected().await;
+        assert!(
+            !displayed.contains("super-secret-master-key-2026"),
+            "MasterKey 分支泄露了原文: {displayed}"
+        );
+        assert!(displayed.starts_with("sha256:"), "应为指纹格式: {displayed}");
+
+        let whitelist = ServiceKeyManager::new_whitelist(vec![
+            ServiceKeyConfig { key: "wl-key-alpha".to_string(), name: "A".to_string() },
+            ServiceKeyConfig { key: "wl-key-beta".to_string(), name: "B".to_string() },
+        ]);
+        let displayed = whitelist.display_expected().await;
+        assert!(!displayed.contains("wl-key-alpha"), "Whitelist 分支泄露了原文: {displayed}");
+        assert!(!displayed.contains("wl-key-beta"), "Whitelist 分支泄露了原文: {displayed}");
+        assert!(displayed.contains("2 keys"), "应报告 key 数量: {displayed}");
+    }
+
+    /// 指纹必须稳定（同一 key 每次一致），否则运维无法做「期望 vs 实际」关联。
+    #[test]
+    fn fingerprint_is_stable_and_non_reversible() {
+        let a = fingerprint("my-key");
+        let b = fingerprint("my-key");
+        let c = fingerprint("other-key");
+        assert_eq!(a, b, "同一 key 指纹必须一致");
+        assert_ne!(a, c, "不同 key 指纹必须不同");
+        assert!(!a.contains("my-key"), "指纹不得包含原文");
     }
 }

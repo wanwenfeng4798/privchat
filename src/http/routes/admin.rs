@@ -38,6 +38,7 @@
 //! - 统计报表：系统统计数据
 
 use base64::Engine as _;
+use crate::auth::service_key_manager::fingerprint;
 use crate::auth::{IssueTokenRequest, IssueTokenResponse};
 use crate::error::{Result, ServerError};
 use crate::http::dto::admin as dto;
@@ -218,9 +219,12 @@ pub(crate) async fn verify_service_key(
 
     // 验证 service key
     if !state.service_key_manager.verify(&service_key).await {
+        // 🔴 提交的 key 和期望的 key 都只记**指纹**，绝不记原文。
+        // 这里曾经直接打 `service_key` 原文 + `display_expected()`（后者当时返回
+        // master.clone()），于是每一次错误的 key 尝试都把真实密钥写进日志。
         warn!(
-            "❌ 无效的 service key: {}, 期望: {}",
-            service_key,
+            "❌ 无效的 service key（指纹 {}），期望: {}",
+            fingerprint(&service_key),
             state.service_key_manager.display_expected().await
         );
         return Err(ServerError::Unauthorized("无效的 service key".to_string()));

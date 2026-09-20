@@ -144,9 +144,13 @@ pub struct PushIntent {
     /// 谁真的收到了（送达回执 / 设备上线 / 撤回）谁来取消它。
     /// 这个窗口同时给了"撤回能收回通知"一个机会：几秒内撤回，推送根本不会发出去。
     pub not_before_ms: i64,
+    /// 已重试次数（PUSH_SPEC §10）。0 = 首推；每次退避重投 +1，达 `max_retry` 放弃。
+    /// 重试只走设备级路径（`device_id` 非空），避免重发已成功的设备。
+    pub retry: u32,
 }
 
 impl PushIntent {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         intent_id: String,
         message_id: u64,
@@ -169,6 +173,21 @@ impl PushIntent {
             payload,
             created_at,
             status: IntentStatus::Pending,
+            retry: 0,
+        }
+    }
+
+    /// 派生一条重试 Intent（PUSH_SPEC §10）：收敛到**单个设备**、`retry + 1`。
+    ///
+    /// 🔴 `device_id` 必须设成失败那台设备：重投走 process_intent 的设备级分支，
+    /// 只发这一台，绝不重发同一 intent 里已成功的其它设备（那会重复通知）。
+    /// `not_before_ms` 保持不变（此刻已是过去值），退避延迟由调度方的 sleep 承担，
+    /// 重投后不再二次等待。
+    pub fn for_retry(&self, device_id: &str) -> Self {
+        Self {
+            device_id: device_id.to_string(),
+            retry: self.retry + 1,
+            ..self.clone()
         }
     }
 }

@@ -23,10 +23,39 @@ use crate::push::provider::{
 };
 use crate::push::types::{IntentStatus, PushIntent, PushTask, PushVendor};
 use crate::repository::UserDeviceRepository;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+/// 推送并发上限。每条 intent 一个任务，但任务数必须有上界（STABILITY_SPEC 禁令 2）。
+/// 64 是经验值：正常推送 <1s，64 并发足以支撑 PUSH_SPEC §12 的 10k msg/s 单机目标；
+/// 满时 acquire 背压到上游 bounded channel（容量 1000），再由 planner try_send 降级。
+const PUSH_MAX_CONCURRENT: usize = 64;
+
+/// 单条 intent 处理的硬超时兜底。provider client 已有 15s 超时，not_before 等待 ≤2s
+/// （PUSH_CANCEL_WINDOW_MS），外加设备查询/状态检查；30s 足够宽裕，又能确保任何
+/// 未预见的挂起都不会让任务永久占用 permit。
+const PUSH_INTENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 重试退避（PUSH_SPEC §10）：第 1 次 10s / 第 2 次 30s / 第 3 次 120s / 超过放弃。
+/// 索引 = 已重试次数（intent.retry）：retry=0 首推失败 → 等 10s；retry=1 → 30s；retry=2 → 120s。
+const RETRY_BACKOFF: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(10),
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(120),
+];
+
+/// 任务结束时把 inflight 计数减回去并刷新 gauge。用 Drop 保证即使 process_intent
+/// panic（tokio 会捕获任务 panic）计数也不会泄漏。
+struct PushInflightGuard(Arc<AtomicUsize>);
+impl Drop for PushInflightGuard {
+    fn drop(&mut self) {
+        let n = self.0.fetch_sub(1, Ordering::Relaxed) - 1;
+        crate::infra::metrics::record_push_inflight(n);
+    }
+}
 
 /// Push Worker（推送工作器）
 ///
@@ -60,6 +89,11 @@ pub struct PushDispatcher {
     meizu_provider: Option<Arc<MeizuProvider>>,
     device_repo: Option<Arc<UserDeviceRepository>>,
     intent_state: Option<Arc<IntentStateManager>>, // Phase 3: Intent 状态管理器
+    /// 重试回投口（PUSH_SPEC §10）：与 planner 共用同一条 intent 通道。
+    /// None = 未接线（单测/降级），失败即放弃，不重试。
+    retry_tx: Option<mpsc::Sender<PushIntent>>,
+    /// 单条推送最大重试次数（`push.max_retry`，默认 3）。
+    max_retry: u32,
 }
 
 impl PushWorker {
@@ -80,6 +114,8 @@ impl PushWorker {
             meizu_provider: None,
             device_repo: None,
             intent_state: None,
+            retry_tx: None,
+            max_retry: 3,
             },
         }
     }
@@ -105,6 +141,8 @@ impl PushWorker {
             meizu_provider: None,
             device_repo: Some(device_repo),
             intent_state: None,
+            retry_tx: None,
+            max_retry: 3,
             },
         }
     }
@@ -141,8 +179,18 @@ impl PushWorker {
             meizu_provider,
             device_repo: Some(device_repo),
             intent_state: Some(intent_state),
+            retry_tx: None,
+            max_retry: 3,
             },
         }
+    }
+
+    /// 接线重试回投口（PUSH_SPEC §10）。传入与 planner 共用的 intent sender 克隆，
+    /// 失败时按 10s/30s/120s 退避重投。不调用则失败即放弃。
+    pub fn with_retry(mut self, retry_tx: mpsc::Sender<PushIntent>, max_retry: u32) -> Self {
+        self.dispatcher.retry_tx = Some(retry_tx);
+        self.dispatcher.max_retry = max_retry;
+        self
     }
 
     /// 启动 Worker，处理 Intent
@@ -153,11 +201,44 @@ impl PushWorker {
         //
         // 每条 intent 都要先等到 not_before（给送达回执/撤回留出取消窗口），串行等待会让
         // 一条消息把整个推送队列堵住几秒——高峰期就是全站推送停摆。
+        //
+        // 🔴 但任务数必须有上界（STABILITY_SPEC 禁令 2）。provider client 已配 15s 超时，
+        // 但超时期间任务仍存活并占用资源；端点黑洞时逐条无界 spawn 会让挂起任务只增不减。
+        // Semaphore 限并发，满时 acquire 自然背压到上游 bounded channel（容量 1000），
+        // 再由 planner 的 try_send 走降级路径——和 offline_worker 同一套写法。
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(PUSH_MAX_CONCURRENT));
+        let inflight = Arc::new(AtomicUsize::new(0));
         while let Some(intent) = self.receiver.recv().await {
             let dispatcher = self.dispatcher.clone();
+            // 满时在这里等待，背压到 receiver（bounded 1000）→ planner try_send 降级。
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    // semaphore 仅在 worker 关闭时 close；优雅退出消费循环。
+                    info!("[PUSH WORKER] semaphore closed, 退出消费循环");
+                    break;
+                }
+            };
+            let inflight_task = inflight.clone();
+            let n = inflight_task.fetch_add(1, Ordering::Relaxed) + 1;
+            crate::infra::metrics::record_push_inflight(n);
             tokio::spawn(async move {
-                if let Err(e) = dispatcher.process_intent(intent).await {
-                    error!("[PUSH WORKER] Failed to process intent: {}", e);
+                // permit 与 inflight 计数移入任务，RAII 持有到任务结束才释放。
+                let _permit = permit;
+                let _guard = PushInflightGuard(inflight_task);
+                // 外层硬超时兜底：process_intent 含 not_before 等待、设备查询、状态检查
+                // 等多段 await，再兜一道确保任何未预见的挂起都不永久占用 permit。
+                match tokio::time::timeout(PUSH_INTENT_TIMEOUT, dispatcher.process_intent(intent)).await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => error!("[PUSH WORKER] Failed to process intent: {}", e),
+                    Err(_) => {
+                        crate::infra::metrics::record_push_timeout();
+                        error!(
+                            "[PUSH WORKER] intent 处理超时（>{:?}），已放弃",
+                            PUSH_INTENT_TIMEOUT
+                        );
+                    }
                 }
             });
         }
@@ -261,8 +342,13 @@ impl PushDispatcher {
                             payload: intent.payload.clone(),
                         };
 
-                        // 调用 Provider
-                        return self.process_single_task(&task).await;
+                        // 调用 Provider。失败时按退避重投——收敛到本台设备（device_id 非空，
+                        // 重投走这条设备级分支），绝不重发同一 intent 里已成功的其它设备。
+                        let result = self.process_single_task(&task).await;
+                        if let Err(e) = &result {
+                            self.schedule_retry(&intent, &task.device_id, e);
+                        }
+                        return result;
                     }
                     Ok(None) => {
                         debug!(
@@ -363,6 +449,8 @@ impl PushDispatcher {
                 Err(e) => {
                     failed_count += 1;
                     self.handle_invalid_token(&e, &task).await;
+                    // 失败重投：收敛到本台设备，不重发本循环里已成功的其它设备。
+                    self.schedule_retry(&intent, &task.device_id, &e);
                     error!("[PUSH WORKER] Failed to send task {}: {}", task.task_id, e);
                     // [TRACE] Node 4: push_failed
                     {
@@ -403,6 +491,64 @@ impl PushDispatcher {
         {
             warn!("[PUSH WORKER] 清理失效 push token 失败: {}", e);
         }
+    }
+
+    /// 失败重试判定：`PushTokenInvalid`（token 已死，且已由 handle_invalid_token 清库）
+    /// 是永久失败，不重试；其余（网络抖动 / 超时 / 5xx / 限流）都当可重试的瞬时错误。
+    fn is_retryable(err: &crate::error::ServerError) -> bool {
+        !matches!(err, crate::error::ServerError::PushTokenInvalid(_))
+    }
+
+    /// 退避重投（PUSH_SPEC §10）：把失败收敛到**单台设备**、retry+1，睡够退避时长后
+    /// try_send 回同一条 intent 通道。
+    ///
+    /// 🔴 不在当前任务里 sleep：那会占着并发 permit 最长 120s，几条慢重试就能拖垮吞吐。
+    /// 改由一个**不持 permit** 的轻量定时任务承担等待，到点再 try_send 回队列，重投时
+    /// 重新走一遍 acquire——permit 只在真正发送时占用。
+    /// 🔴 try_send（非阻塞）：队列满说明上游已积压，丢弃这条重试并告警，绝不无界堆积
+    /// （STABILITY_SPEC 禁令 1/2）。退避与重试次数共同保证重投任务数量有界。
+    fn schedule_retry(
+        &self,
+        intent: &PushIntent,
+        device_id: &str,
+        err: &crate::error::ServerError,
+    ) {
+        if !Self::is_retryable(err) {
+            return;
+        }
+        let Some(tx) = &self.retry_tx else {
+            return;
+        };
+        if intent.retry >= self.max_retry {
+            warn!(
+                "[PUSH WORKER] intent {} device {} 重试已达上限 {}，放弃: {}",
+                intent.intent_id, device_id, self.max_retry, err
+            );
+            return;
+        }
+        let Some(backoff) = RETRY_BACKOFF.get(intent.retry as usize).copied() else {
+            warn!(
+                "[PUSH WORKER] intent {} retry={} 无对应退避档，放弃",
+                intent.intent_id, intent.retry
+            );
+            return;
+        };
+        let next = intent.for_retry(device_id);
+        let tx = tx.clone();
+        let retry_no = next.retry;
+        let intent_id = next.intent_id.clone();
+        let device = device_id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(backoff).await;
+            match tx.try_send(next) {
+                Ok(()) => debug!(
+                    "[PUSH WORKER] 重投 intent {intent_id} device {device}（第 {retry_no} 次，退避 {backoff:?}）"
+                ),
+                Err(e) => warn!(
+                    "[PUSH WORKER] 重投失败 intent {intent_id} device {device}（第 {retry_no} 次）: {e}"
+                ),
+            }
+        });
     }
 
     /// vendor → provider。**没配就是没配**：返回 None，由调用方计入失败并留日志。

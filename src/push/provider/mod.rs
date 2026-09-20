@@ -38,3 +38,23 @@ pub use provider_trait::PushProvider; // ✨ Phase 3
 pub use vivo::VivoProvider;
 pub use xiaomi::XiaomiProvider;
 pub use zte::ZteProvider;
+
+/// 构造带超时的推送 HTTP client。
+///
+/// 🔴 绝不能用 `Client::new()`：reqwest 默认**无 connect timeout、无 request timeout**。
+/// APNs/FCM 端点网络黑洞时（大陆机房到 FCM 是常态场景），每个请求永久挂起；配合
+/// worker 的逐条 spawn，挂起任务只增不减，内存持续上涨且无法自愈——这正是
+/// STABILITY_SPEC 禁令 2（禁无上限 spawn）与禁令 3（出站必须有超时）定义的事故形态。
+///
+/// connect 5s / 整体 15s：APNs HTTP/2 单请求正常 <1s，15s 足够兜住慢网络，又不至于
+/// 让任务长期占用 worker 的并发 permit。超时后由 worker 外层统一记失败。
+///
+/// `build()` 只在 TLS 后端不可用时失败（rustls 已启用，属启动期灾难性配置错误），
+/// 此时推送根本无法工作，fail-fast 比静默退回无超时 client 更安全。
+pub fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .expect("构造推送 HTTP client 失败（TLS 后端不可用）")
+}

@@ -44,12 +44,20 @@ use uuid::Uuid;
 /// 2 秒足够覆盖一次往返回执，而用户对"消息到手机"的感知阈值远在这之上。
 const PUSH_CANCEL_WINDOW_MS: i64 = 2_000;
 
+/// PUSH_SPEC §14 默认值：同一用户 60s 内最多 10 条推送。
+const DEFAULT_RATE_LIMIT_MAX: u32 = 10;
+const DEFAULT_RATE_LIMIT_WINDOW_SECS: u64 = 60;
+
 pub struct PushPlanner {
     redis: Option<Arc<RedisClient>>,
     connection_manager: Option<Arc<ConnectionManager>>,
     intent_state: Arc<IntentStateManager>, // Phase 3: 共享状态管理器
     /// 查会话免打扰用。None（单测/降级）时不做免打扰过滤。
     device_repo: Option<Arc<crate::repository::UserDeviceRepository>>,
+    /// 限流：窗口内同一用户最多推送条数（PUSH_SPEC §10 / §14）。
+    rate_limit_max: u32,
+    /// 限流窗口（秒）。
+    rate_limit_window_secs: u64,
 }
 
 impl PushPlanner {
@@ -59,6 +67,8 @@ impl PushPlanner {
             connection_manager: None,
             intent_state: Arc::new(IntentStateManager::new()),
             device_repo: None,
+            rate_limit_max: DEFAULT_RATE_LIMIT_MAX,
+            rate_limit_window_secs: DEFAULT_RATE_LIMIT_WINDOW_SECS,
         }
     }
 
@@ -69,6 +79,8 @@ impl PushPlanner {
             connection_manager: None,
             intent_state: Arc::new(IntentStateManager::new()),
             device_repo: None,
+            rate_limit_max: DEFAULT_RATE_LIMIT_MAX,
+            rate_limit_window_secs: DEFAULT_RATE_LIMIT_WINDOW_SECS,
         }
     }
 
@@ -82,6 +94,8 @@ impl PushPlanner {
             connection_manager: None,
             intent_state,
             device_repo: None,
+            rate_limit_max: DEFAULT_RATE_LIMIT_MAX,
+            rate_limit_window_secs: DEFAULT_RATE_LIMIT_WINDOW_SECS,
         }
     }
 
@@ -96,7 +110,16 @@ impl PushPlanner {
             connection_manager: Some(connection_manager),
             intent_state,
             device_repo: None,
+            rate_limit_max: DEFAULT_RATE_LIMIT_MAX,
+            rate_limit_window_secs: DEFAULT_RATE_LIMIT_WINDOW_SECS,
         }
+    }
+
+    /// 注入限流参数（PUSH_SPEC §14）。构造后链式调用。
+    pub fn with_rate_limit(mut self, max: u32, window_secs: u64) -> Self {
+        self.rate_limit_max = max;
+        self.rate_limit_window_secs = window_secs;
+        self
     }
 
     /// 注入设备仓库（用于会话免打扰判定）。构造后链式调用。
@@ -173,6 +196,52 @@ impl PushPlanner {
         }
 
         Ok(())
+    }
+
+    /// 推送准入（PUSH_SPEC §10）：同一会话 60s 内去重 + 同一用户 60s 内限流 10 条。
+    ///
+    /// 返回 true = 允许推送。Redis 未配置或查询失败时**放行**（fail-open）：限流是
+    /// 反骚扰的优化，不是正确性闸门；Redis 抖动时宁可多推一条，也不能把该到的
+    /// 推送全部拦掉。去重键先占，命中的重复推送不消耗限流额度。
+    async fn admission_allowed(&self, user_id: u64, conversation_id: u64) -> bool {
+        let Some(redis) = &self.redis else {
+            return true;
+        };
+        let window = self.rate_limit_window_secs as usize;
+        // 1. 去重：同一 (uid, conv) 窗口内只推一条。SET NX 失败 = 已存在 = 重复。
+        let dedup_key = format!("push:dedup:{user_id}:{conversation_id}");
+        match redis.set_nx_ex(&dedup_key, window, "1").await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(
+                    "[PUSH PLANNER] 会话 {} 对用户 {} 在 {}s 内已推过，去重跳过",
+                    conversation_id, user_id, window
+                );
+                return false;
+            }
+            Err(e) => {
+                warn!("[PUSH PLANNER] 去重键写入失败，放行本次推送: {e}");
+            }
+        }
+        // 2. 限流：窗口内同一用户最多 rate_limit_max 条。
+        let rate_key = format!("push:rate_limit:{user_id}");
+        match redis
+            .incr_with_ttl(&rate_key, self.rate_limit_window_secs)
+            .await
+        {
+            Ok(n) if n > self.rate_limit_max as u64 => {
+                debug!(
+                    "[PUSH PLANNER] 用户 {} 在 {}s 内推送已达 {} 条，限流跳过",
+                    user_id, window, n
+                );
+                false
+            }
+            Ok(_) => true,
+            Err(e) => {
+                warn!("[PUSH PLANNER] 限流计数失败，放行本次推送: {e}");
+                true
+            }
+        }
     }
 
     async fn handle_message_committed(
@@ -261,6 +330,12 @@ impl PushPlanner {
             return Ok(());
         }
         let unread_total = ctx.unread_total;
+
+        // 推送准入：去重 + 限流（PUSH_SPEC §10）。放在 mute 之后、生成 intent 之前，
+        // 设备级 / 用户级两条路径共用同一道闸。
+        if !self.admission_allowed(recipient_id, conversation_id).await {
+            return Ok(());
+        }
 
         // ✨ Phase 3.5: 如果指定了 device_id，只为该设备生成 Intent
         if let Some(device_id) = device_id {

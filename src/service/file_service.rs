@@ -160,49 +160,17 @@ async fn publish_object(
     final_path: &str,
 ) -> Result<PublishOutcome> {
     if let Some(root) = local_root {
-        let from = std::path::Path::new(root).join(staging);
-        let to = std::path::Path::new(root).join(final_path);
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ServerError::Internal(format!("创建目标目录失败: {e}")))?;
-        }
-
-        // 🔴 **字节先落盘，目录项后指过去。**
-        //
-        // `hard_link` 只改目录项，不保证内容已经在盘上。少了这一步，掉电后完全可能
-        // 出现「PG 里有记录、正式路径上的文件是个空洞」——而记录一旦提交就是永久的。
-        fsync_file(&from)?;
-
-        return match std::fs::hard_link(&from, &to) {
-            Ok(()) => {
-                // 新目录项本身也要落盘，否则掉电后记录指向一个不存在的名字。
-                fsync_dir(to.parent())?;
-                // 发布成功后**立即**移除临时对象：客户端可能在这之后就离线了，
-                // 清理不能只靠 callback。
-                // 这次 unlink 不 fsync：最坏情况是留下一个临时文件，由扫描回收——
-                // 这个方向的错误是可回收的垃圾，而不是丢数据。
-                let _ = std::fs::remove_file(&from);
-                Ok(PublishOutcome::Published)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                Ok(PublishOutcome::AlreadyPresent)
-            }
-            // 🔴 跨文件系统（`EXDEV`）：**必须**有降级路径，不能报错了事。
-            //
-            // 会话临时目录与存储根今天同盘只是当前部署的偶然；文件长大之后把上传盘
-            // 单独挂出来是常规操作，那一刻所有上传都会失败。spec §9.2 明确要求：
-            // 流式复制到**目标文件系统内**的临时名 → fsync → 在该文件系统内原子发布。
-            //
-            // 📌 spec 原文写的是「原子 rename」，这里用 link + unlink：rename 会静默
-            // 覆盖，与 no-clobber 冲突；link 同样原子，且目标存在时返回 EEXIST。
-
-            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-                publish_across_filesystems(&from, &to)
-            }
-            Err(e) => Err(ServerError::Internal(format!(
-                "发布对象失败（{from:?} → {to:?}）：{e}"
-            ))),
-        };
+        // 🔴 本地后端的发布全是同步文件系统操作（create_dir_all / fsync / hard_link，
+        // 跨盘时还有一次流式 io::copy + fsync），在反应堆线程上跑会卡住整条 worker。
+        // 全部移进 spawn_blocking（P0-1）；锁与 op 都不参与本地分支。
+        let root = root.to_string();
+        let staging = staging.to_string();
+        let final_path = final_path.to_string();
+        return tokio::task::spawn_blocking(move || {
+            publish_object_local(&root, &staging, &final_path)
+        })
+        .await
+        .map_err(|e| ServerError::Internal(format!("发布对象的阻塞任务异常退出: {e}")))?;
     }
 
     // 非本地后端：no-clobber 只能由后端的条件写提供。
@@ -254,6 +222,53 @@ async fn publish_object(
             Ok(PublishOutcome::AlreadyPresent)
         }
         Err(e) => Err(ServerError::Internal(format!("发布对象失败: {e}"))),
+    }
+}
+
+/// 本地后端的发布（同步）。由 [`publish_object`] 在 `spawn_blocking` 里调用，
+/// 不直接在反应堆线程上跑（P0-1）。
+fn publish_object_local(root: &str, staging: &str, final_path: &str) -> Result<PublishOutcome> {
+    let from = std::path::Path::new(root).join(staging);
+    let to = std::path::Path::new(root).join(final_path);
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| ServerError::Internal(format!("创建目标目录失败: {e}")))?;
+    }
+
+    // 🔴 **字节先落盘，目录项后指过去。**
+    //
+    // `hard_link` 只改目录项，不保证内容已经在盘上。少了这一步，掉电后完全可能
+    // 出现「PG 里有记录、正式路径上的文件是个空洞」——而记录一旦提交就是永久的。
+    fsync_file(&from)?;
+
+    match std::fs::hard_link(&from, &to) {
+        Ok(()) => {
+            // 新目录项本身也要落盘，否则掉电后记录指向一个不存在的名字。
+            fsync_dir(to.parent())?;
+            // 发布成功后**立即**移除临时对象：客户端可能在这之后就离线了，
+            // 清理不能只靠 callback。
+            // 这次 unlink 不 fsync：最坏情况是留下一个临时文件，由扫描回收——
+            // 这个方向的错误是可回收的垃圾，而不是丢数据。
+            let _ = std::fs::remove_file(&from);
+            Ok(PublishOutcome::Published)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(PublishOutcome::AlreadyPresent)
+        }
+        // 🔴 跨文件系统（`EXDEV`）：**必须**有降级路径，不能报错了事。
+        //
+        // 会话临时目录与存储根今天同盘只是当前部署的偶然；文件长大之后把上传盘
+        // 单独挂出来是常规操作，那一刻所有上传都会失败。spec §9.2 明确要求：
+        // 流式复制到**目标文件系统内**的临时名 → fsync → 在该文件系统内原子发布。
+        //
+        // 📌 spec 原文写的是「原子 rename」，这里用 link + unlink：rename 会静默
+        // 覆盖，与 no-clobber 冲突；link 同样原子，且目标存在时返回 EEXIST。
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            publish_across_filesystems(&from, &to)
+        }
+        Err(e) => Err(ServerError::Internal(format!(
+            "发布对象失败（{from:?} → {to:?}）：{e}"
+        ))),
     }
 }
 

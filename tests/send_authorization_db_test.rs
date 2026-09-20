@@ -17,7 +17,9 @@ use privchat::repository::PgChannelRepository;
 use privchat::service::send_authorization::{
     authorize_send_to_channel, SendAuthorizationDeps, SendRefusal,
 };
-use privchat::service::{BlacklistService, ChannelService, FriendService, PrivacyService};
+use privchat::service::{
+    BlacklistService, ChannelService, FriendService, PrivacyService, QRCodeService,
+};
 
 const OWNER: i64 = 9_960_001;
 const MEMBER: i64 = 9_960_002;
@@ -58,6 +60,7 @@ async fn deps() -> Option<(SendAuthorizationDeps, Arc<sqlx::PgPool>)> {
                 cache,
                 channel_service,
                 friend_service,
+                Arc::new(QRCodeService::new()),
             )),
         },
         pool,

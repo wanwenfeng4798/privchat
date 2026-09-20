@@ -172,6 +172,38 @@ impl RedisClient {
         .await
     }
 
+    /// 固定窗口计数器：`INCR key`，首次创建时原子地打上 `EXPIRE window_secs`。
+    /// 返回自增后的计数值。用于 PUSH_SPEC §10 的推送限流（`push:rate_limit:{uid}`）。
+    ///
+    /// 🔴 INCR 与 EXPIRE 必须在同一个 Lua 脚本里原子完成：分两次调用的话，
+    /// 若 INCR 之后、EXPIRE 之前进程崩溃，这个键就永不过期，限流窗口永远关不上。
+    pub async fn incr_with_ttl(
+        &self,
+        key: &str,
+        window_secs: u64,
+    ) -> Result<u64, crate::error::ServerError> {
+        const SCRIPT: &str = r#"
+            local n = redis.call('INCR', KEYS[1])
+            if n == 1 then
+                redis.call('EXPIRE', KEYS[1], ARGV[1])
+            end
+            return n
+        "#;
+        self.with_timeout(async {
+            let mut conn = self.get_conn().await?;
+            let n: i64 = redis::Script::new(SCRIPT)
+                .key(key)
+                .arg(window_secs)
+                .invoke_async(&mut *conn)
+                .await
+                .map_err(|e| {
+                    crate::error::ServerError::Internal(format!("Redis INCR+EXPIRE failed: {e}"))
+                })?;
+            Ok(n.max(0) as u64)
+        })
+        .await
+    }
+
     /// Refresh a lease only when the fencing token still matches.
     pub async fn compare_and_expire(
         &self,

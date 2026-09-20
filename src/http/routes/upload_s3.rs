@@ -184,7 +184,7 @@ pub(super) async fn s3_status(
     let _lock = lock_or_busy(session).await?;
     let total = session.manifest().total_size;
 
-    if session.completed_file_id()?.is_some() {
+    if session.completed_file_id_async().await?.is_some() {
         return Ok(ApiEnvelope::ok(ChunkedStatusResponse {
             received: vec![Range { offset: 0, length: total }],
             missing: vec![],
@@ -267,7 +267,7 @@ pub(super) async fn s3_complete(
     headers: &axum::http::HeaderMap,
 ) -> ApiResult<UploadResponse> {
     // 1. 墓碑 → 幂等回原 file_id（与 proxy 相同）。
-    if let Some(existing) = session.completed_file_id()? {
+    if let Some(existing) = session.completed_file_id_async().await? {
         return chunked_completed_response(state, session, existing).await;
     }
 
@@ -280,8 +280,8 @@ pub(super) async fn s3_complete(
             )));
         }
         tracing::info!("♻️ 预留的 file_id={reserved} 已落库，补写墓碑并返回");
-        session.write_completed(reserved)?;
-        session.drop_payload();
+        session.write_completed_async(reserved).await?;
+        session.drop_payload_async().await;
         return chunked_completed_response(state, session, reserved).await;
     }
 
@@ -390,7 +390,17 @@ pub(super) async fn s3_complete(
                     Err(ServerError::Internal(format!("组装分片失败: {m}")))
                 }
                 // Conflict/PreconditionFailed 已被 complete_recovery_for 分走。
-                _ => unreachable!("complete_recovery_for 未覆盖的错误"),
+                // 🔴 不能用 unreachable!：`_` 吞掉了穷尽性检查，NumberedPartError 未来
+                // 新增变体时编译器不会提醒这里，线上触发即 panic，会话状态停在半途
+                // （违背 RESUMABLE_UPLOAD_SPEC §8.5「删失败回可重试 5xx」）。改为回
+                // 可重试 5xx + error 日志，让客户端重传而非炸掉请求。
+                other => {
+                    tracing::error!("complete_recovery_for 未覆盖的错误分支: {:?}", other);
+                    Err(ServerError::Internal(format!(
+                        "组装分片失败（未分类错误）: {:?}",
+                        other
+                    )))
+                }
             },
         };
     }
@@ -700,11 +710,11 @@ async fn record_and_finish(
         }
     };
     // 墓碑（原子 + fsync）：落库成功后写不上只影响下次重试走第 2 步，不判失败。
-    if let Err(e) = session.write_completed(metadata.file_id) {
+    if let Err(e) = session.write_completed_async(metadata.file_id).await {
         tracing::warn!("写 S3 完成墓碑失败 file_id={}: {e}", metadata.file_id);
     } else {
         // 墓碑之后才删本地 parts（S3 会话本就为空，口径与 proxy 一致）。
-        session.drop_payload();
+        session.drop_payload_async().await;
     }
     Ok(metadata)
 }
@@ -767,7 +777,7 @@ pub(super) async fn s3_abort(
     }
 
     // 确认清空后才删本地目录。
-    session.discard()?;
+    session.discard_async().await?;
     Ok(ApiEnvelope::ok(serde_json::json!({ "aborted": true })))
 }
 

@@ -1008,7 +1008,11 @@ impl ChatServer {
                 Arc::clone(&intent_state),
                 connection_manager.clone(),
             )
-            .with_device_repo(Arc::clone(&user_device_repo)),
+            .with_device_repo(Arc::clone(&user_device_repo))
+            .with_rate_limit(
+                config.push.rate_limit_max,
+                config.push.rate_limit_window_secs,
+            ),
         );
         let planner_event_bus = Arc::clone(&event_bus);
         let planner_tx = push_tx.clone();
@@ -1512,7 +1516,10 @@ impl ChatServer {
             lenovo_provider,
             zte_provider,
             meizu_provider,
-        );
+        )
+        // 重试回投口：与 planner 共用同一条 intent 通道（push_tx），
+        // 失败时按 10s/30s/120s 退避重投，最多 config.push.max_retry 次。
+        .with_retry(push_tx.clone(), config.push.max_retry);
         tokio::spawn(async move {
             if let Err(e) = push_worker.start().await {
                 error!("❌ PushWorker 启动失败: {}", e);

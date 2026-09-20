@@ -334,11 +334,12 @@ async fn upload_file(
     //     且整包接收期间独占；
     //   · `reserved_file_id` + 墓碑——重复 POST 复用同一个预留 id，落库时撞主键即回读。
     // （早期版本曾用 `upload_completion_key` 列做这件事，属把临时态写进业务库，已撤销。）
-    let session = crate::service::upload_session::UploadSession::open(
-        &state.file_service.upload_session_root()?,
+    let session = crate::service::upload_session::UploadSession::open_async(
+        state.file_service.upload_session_root()?,
         token_info.user_id,
-        &token_info.upload_id,
-    )?;
+        token_info.upload_id.clone(),
+    )
+    .await?;
 
     // 🔴 **幂等出口排在接收 body 之前，真源是会话自己的墓碑。**
     //
@@ -348,17 +349,17 @@ async fn upload_file(
     //
     // 📌 判据只看**临时会话状态**：上传中间态不进业务库。会话没了就是没了，
     // 客户端重新申请 token 从头传（这正是 `SessionGone` 的语义）。
-    if let Some(existing) = session.completed_file_id()? {
+    if let Some(existing) = session.completed_file_id_async().await? {
         return completed_response(&state, &token_info, existing).await;
     }
 
-    let _mode_guard = session.begin_whole()?;
+    let _mode_guard = session.begin_whole_async().await?;
 
     // 🔴 **预留必须在收字节之前**，而且要先落盘。
     //
     // 预留写在接收之后的话，传输中途崩溃就没有预留——重试会分配新 id，上一次的
     // 半成品对象没人认领，变成垃圾。
-    let reserved = match session.reserved_file_id()? {
+    let reserved = match session.reserved_file_id_async().await? {
         Some(id) => {
             // 🔴 **带着预留 id 回来时，先问正式文件表：这个 id 是不是已经落库了。**
             //
@@ -374,7 +375,7 @@ async fn upload_file(
                     )));
                 }
                 tracing::info!("♻️ 预留的 file_id={id} 已落库，补写墓碑并返回");
-                let _ = session.mark_completed(id);
+                let _ = session.mark_completed_async(id).await;
                 return completed_response(&state, &token_info, id).await;
             }
             Some(id)
@@ -382,7 +383,7 @@ async fn upload_file(
         None => {
             // 先分配、先落盘，再开 writer。
             let id = state.file_service.reserve_file_id().await?;
-            session.reserve_file_id(id)?;
+            session.reserve_file_id_async(id).await?;
             Some(id)
         }
     };
@@ -455,7 +456,7 @@ async fn upload_file(
 
     // 成功：把会话推到 Completed（墓碑），迟到的重复请求由它与幂等键一起回答。
     // 失败路径不走这里——guard 的 Drop 会把状态放回 Idle，让同一张 token 能重试。
-    if let Err(e) = _mode_guard.complete(metadata.file_id) {
+    if let Err(e) = _mode_guard.complete_async(metadata.file_id).await {
         // 落库已经成功，会话状态没写上只影响墓碑；下次请求会走幂等出口拿回同一个
         // file_id，所以不把整个上传判失败。
         tracing::warn!("写入上传会话完成状态失败 file_id={}: {e}", metadata.file_id);
@@ -625,11 +626,11 @@ async fn put_chunk(
     let _lock = lock_or_busy(&session).await?;
 
     // 已完成的会话不再收字节：迟到的分片对结果没有意义。
-    if session.completed_file_id()?.is_some() {
+    if session.completed_file_id_async().await?.is_some() {
         return Err(coded(E::UploadSessionCompleted, 409, "该上传已完成"));
     }
 
-    let outcome = match session.write_part(q.offset, &body, &declared) {
+    let outcome = match session.write_part_async(q.offset, body, declared).await {
         Ok(PartOutcome::Written) => "written",
         Ok(PartOutcome::AlreadyPresent) => "already_present",
         Err(ChunkError::OutOfRange(m)) | Err(ChunkError::NotAligned(m)) => {
@@ -645,7 +646,7 @@ async fn put_chunk(
         Err(ChunkError::Overlap(m)) => return Err(coded(E::UploadRangeOverlap, 409, m)),
         Err(ChunkError::Io(e)) => return Err(e),
     };
-    let (_, missing, received_bytes) = session.status()?;
+    let (_, missing, received_bytes) = session.status_async().await?;
     Ok(ApiEnvelope::ok(ChunkResponse {
         outcome,
         received_bytes,
@@ -713,11 +714,9 @@ async fn part_urls(
     let _lock = lock_or_busy(&session).await?;
     // 🔴 完成墓碑必须在**拿到锁之后**查：锁前查、锁后签的话，complete 可以在两者
     // 之间完成，这里就会给已关闭的 MPU 签出无效 URL（第十二轮评审 P1）。
-    if session.completed_file_id()?.is_some() {
+    if session.completed_file_id_async().await?.is_some() {
         return Err(coded(E::UploadSessionCompleted, 409, "该上传已完成"));
     }
-    // 🔴 part_digests 增量写入需要可变会话（第二十九轮；其余字段仍只读）。
-    let mut session = session;
 
     let manifest = session.manifest();
     // spec 冻结的 manifest 平铺字段：与分片参数作为整体原子使用（提取逻辑与
@@ -784,7 +783,7 @@ async fn part_urls(
     }
     // 🔴 写失败必须报错：Complete 体依赖这些声明组装，丢下来 complete 永远过不去；
     // 此刻客户端还没拿到 URL、未传任何字节，重试无损。
-    session.record_part_digests(&decls).map_err(|e| {
+    session.record_part_digests_async(decls).await.map_err(|e| {
         ServerError::Internal(format!("逐片摘要声明落盘失败，请重试: {e}"))
     })?;
     Ok(ApiEnvelope::ok(PartUrlResponse { parts: out }))
@@ -800,8 +799,8 @@ async fn upload_status(
     if session.manifest().transport == crate::service::chunked_upload::TRANSPORT_S3_MULTIPART_V1 {
         return super::upload_s3::s3_status(&state, &session).await;
     }
-    let completed = session.completed_file_id()?.is_some();
-    let (received, missing, received_bytes) = session.status()?;
+    let completed = session.completed_file_id_async().await?.is_some();
+    let (received, missing, received_bytes) = session.status_async().await?;
     Ok(ApiEnvelope::ok(ChunkedStatusResponse {
         received,
         missing,
@@ -900,7 +899,7 @@ async fn complete_upload(
     }
 
     // 1. 墓碑
-    if let Some(existing) = session.completed_file_id()? {
+    if let Some(existing) = session.completed_file_id_async().await? {
         return chunked_completed_response(&state, &session, existing).await;
     }
 
@@ -913,8 +912,8 @@ async fn complete_upload(
             )));
         }
         tracing::info!("♻️ 预留的 file_id={reserved} 已落库，补写墓碑并返回");
-        session.write_completed(reserved)?;
-        session.drop_payload();
+        session.write_completed_async(reserved).await?;
+        session.drop_payload_async().await;
         return chunked_completed_response(&state, &session, reserved).await;
     }
 
@@ -923,7 +922,7 @@ async fn complete_upload(
     let site_key = site_key_of(&state, session.manifest().encryption_key_id)?;
 
     // 3. 拼接 + 核验
-    let (_, written, stored_sha256) = match session.assemble() {
+    let (_, written, stored_sha256) = match session.assemble_async().await {
         Ok(v) => v,
         Err(AssembleError::Missing(missing)) => {
             let received: u64 = session.manifest().total_size
@@ -975,11 +974,11 @@ async fn complete_upload(
     crate::service::file_service::crash_point("after_commit_before_tombstone");
 
     // 5. 墓碑（原子 + fsync）——落库成功后墓碑写不上只影响下次重试走第 2 步，不判失败。
-    if let Err(e) = session.write_completed(metadata.file_id) {
+    if let Err(e) = session.write_completed_async(metadata.file_id).await {
         tracing::warn!("写分片完成墓碑失败 file_id={}: {e}", metadata.file_id);
     } else {
         // 6. 墓碑之后才删 parts。
-        session.drop_payload();
+        session.drop_payload_async().await;
     }
     info!("✅ 分片上传完成: file_id={} upload_id={}", metadata.file_id, session.upload_id());
 
@@ -1009,7 +1008,7 @@ async fn abort_upload(
             "该上传正被另一个请求占用，无法中止，请稍后重试",
         ));
     };
-    if session.completed_file_id()?.is_some() {
+    if session.completed_file_id_async().await?.is_some() {
         return Err(coded(
             privchat_protocol::ErrorCode::UploadSessionCompleted,
             409,
@@ -1020,6 +1019,6 @@ async fn abort_upload(
     if session.manifest().transport == crate::service::chunked_upload::TRANSPORT_S3_MULTIPART_V1 {
         return super::upload_s3::s3_abort(&state, &session).await;
     }
-    session.discard()?;
+    session.discard_async().await?;
     Ok(ApiEnvelope::ok(serde_json::json!({ "aborted": true })))
 }

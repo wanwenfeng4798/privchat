@@ -41,6 +41,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
@@ -263,6 +264,11 @@ impl From<ServerError> for OpenError {
 }
 
 /// 一个分片会话目录。持有它不等于持锁；锁见 [`ChunkedSession::lock`]。
+///
+/// `Clone`：异步包装方法（`*_async`）把会话克隆进 `spawn_blocking`，让带 fsync
+/// 的文件系统操作离开反应堆线程；克隆体不含锁句柄，互斥语义仍由调用方持有的
+/// [`SessionLock`] 保证。
+#[derive(Clone)]
 pub struct ChunkedSession {
     upload_id: String,
     dir: PathBuf,
@@ -797,6 +803,96 @@ impl ChunkedSession {
     pub fn discard(&self) -> Result<()> {
         std::fs::remove_dir_all(&self.dir)
             .map_err(|e| ServerError::Internal(format!("删除会话目录 {:?} 失败: {e}", self.dir)))
+    }
+
+    // ===== 异步包装（P0-1）：把带 fsync 的同步文件系统操作移出反应堆线程 =====
+    //
+    // 🔴 flock 锁由调用方持有（`SessionLock` guard 在 async 侧存活），blocking 任务
+    // 只在锁保护下操作 part 文件；clone 出的会话不含锁句柄，互斥语义不变。
+
+    /// `spawn_blocking` 的 JoinError → 统一的 ServerError。
+    fn blocking_panic(what: &str, e: tokio::task::JoinError) -> ServerError {
+        ServerError::Internal(format!("{what} 的阻塞任务异常退出: {e}"))
+    }
+
+    /// [`Self::write_part`] 的异步版：分片字节落盘（含 2 次 fsync + SHA-256）移出反应堆。
+    /// `bytes` 用 [`Bytes`] 传入，克隆进闭包零拷贝。
+    pub async fn write_part_async(
+        &self,
+        offset: u64,
+        bytes: Bytes,
+        declared_sha256: String,
+    ) -> std::result::Result<PartOutcome, ChunkError> {
+        let s = self.clone();
+        tokio::task::spawn_blocking(move || s.write_part(offset, &bytes, &declared_sha256))
+            .await
+            .map_err(|e| ChunkError::Io(Self::blocking_panic("写分片", e)))?
+    }
+
+    /// [`Self::assemble`] 的异步版：整文件拼接 + SHA-256 移出反应堆。
+    pub async fn assemble_async(
+        &self,
+    ) -> std::result::Result<(PathBuf, u64, String), AssembleError> {
+        let s = self.clone();
+        tokio::task::spawn_blocking(move || s.assemble())
+            .await
+            .map_err(|e| AssembleError::Io(Self::blocking_panic("拼接分片", e)))?
+    }
+
+    /// [`Self::status`] 的异步版。
+    pub async fn status_async(&self) -> Result<(Vec<Range>, Vec<Range>, u64)> {
+        let s = self.clone();
+        tokio::task::spawn_blocking(move || s.status())
+            .await
+            .map_err(|e| Self::blocking_panic("扫描分片状态", e))?
+    }
+
+    /// [`Self::scan_parts`] 的异步版。
+    pub async fn scan_parts_async(&self) -> Result<Vec<Range>> {
+        let s = self.clone();
+        tokio::task::spawn_blocking(move || s.scan_parts())
+            .await
+            .map_err(|e| Self::blocking_panic("扫描 parts", e))?
+    }
+
+    /// [`Self::completed_file_id`] 的异步版。
+    pub async fn completed_file_id_async(&self) -> Result<Option<u64>> {
+        let s = self.clone();
+        tokio::task::spawn_blocking(move || s.completed_file_id())
+            .await
+            .map_err(|e| Self::blocking_panic("读完成墓碑", e))?
+    }
+
+    /// [`Self::write_completed`] 的异步版（原子写 + fsync 目录）。
+    pub async fn write_completed_async(&self, file_id: u64) -> Result<()> {
+        let s = self.clone();
+        tokio::task::spawn_blocking(move || s.write_completed(file_id))
+            .await
+            .map_err(|e| Self::blocking_panic("写完成墓碑", e))?
+    }
+
+    /// [`Self::record_part_digests`] 的异步版。
+    /// 🔴 in-memory 突变只发生在 clone 上：调用方（part-url 签发路径）写盘成功后
+    /// 立即返回，不依赖突变后的 manifest，落盘结果才是权威。
+    pub async fn record_part_digests_async(&self, decls: Vec<(u32, String)>) -> Result<()> {
+        let mut s = self.clone();
+        tokio::task::spawn_blocking(move || s.record_part_digests(&decls))
+            .await
+            .map_err(|e| Self::blocking_panic("写逐片摘要声明", e))?
+    }
+
+    /// [`Self::drop_payload`] 的异步版（remove_dir_all 对多片会话可能很慢）。
+    pub async fn drop_payload_async(&self) {
+        let s = self.clone();
+        let _ = tokio::task::spawn_blocking(move || s.drop_payload()).await;
+    }
+
+    /// [`Self::discard`] 的异步版。
+    pub async fn discard_async(&self) -> Result<()> {
+        let s = self.clone();
+        tokio::task::spawn_blocking(move || s.discard())
+            .await
+            .map_err(|e| Self::blocking_panic("删除会话目录", e))?
     }
 }
 

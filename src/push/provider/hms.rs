@@ -49,7 +49,7 @@ impl HmsProvider {
             .trim_end_matches('/')
             .to_string();
         Self {
-            client: Client::new(),
+            client: super::build_http_client(),
             app_id,
             access_token,
             endpoint,
